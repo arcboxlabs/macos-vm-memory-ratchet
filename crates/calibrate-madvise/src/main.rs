@@ -11,10 +11,9 @@
 //! `MADV_FREE` leave the footprint unchanged; only `MADV_FREE_REUSABLE`
 //! moves it — the pages show up in the `reusable` counter instead.
 
-use ledger::{delta_mib, row, Ledger};
+use ledger::{delta_mib, row, Ledger, PAGE};
 
 const SIZE: usize = 1 << 30; // 1 GiB
-const PAGE: usize = 16 * 1024; // Apple Silicon host page
 
 struct Advice {
     name: &'static str,
@@ -63,6 +62,7 @@ fn touch(ptr: *mut u8, size: usize) {
 }
 
 fn main() {
+    ledger::assert_host_page_size();
     println!("calibrate-madvise: 1 GiB dirty anonymous memory per advice\n");
 
     let mut summary = Vec::new();

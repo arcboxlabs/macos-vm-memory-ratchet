@@ -18,10 +18,9 @@
 //! (both measured: exactly 0 pages reclaimed). Expect the machine to be
 //! sluggish for ~15–30 s.
 
-use ledger::{row, Ledger};
+use ledger::{row, Ledger, PAGE};
 
 const SIZE: usize = 1 << 30; // 1 GiB per buffer
-const PAGE: usize = 16 * 1024;
 const PATTERN: u64 = 0xC0DE_D00D_FEED_FACE;
 const HOLD_SECS: u64 = 8;
 
@@ -64,6 +63,7 @@ fn survey(ptr: *const u8, size: usize) -> (usize, usize) {
 
 fn main() {
     ledger::pressure::maybe_run_generator();
+    ledger::assert_host_page_size();
 
     let args: Vec<String> = std::env::args().collect();
     let pressure_gb: usize = args

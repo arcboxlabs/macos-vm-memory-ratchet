@@ -12,11 +12,11 @@
 //! The child is this same binary, re-executed with `RATCHET_PRESSURE_GEN_GB`
 //! set. Call [`maybe_run_generator`] first thing in `main`.
 
+use crate::PAGE;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
 const GEN_ENV: &str = "RATCHET_PRESSURE_GEN_GB";
-const PAGE: usize = 16 * 1024;
 
 /// If this process was spawned as a pressure child, run the generator and
 /// never return: dirty N GiB, print `HOLDING`, then sleep until killed.

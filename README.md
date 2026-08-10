@@ -18,23 +18,37 @@ Developer ID — the hypervisor demo is ad-hoc signed.
 |---|---|---|
 | `calibrate-madvise` | none | What each `madvise` advice does to `phys_footprint`: `MADV_DONTNEED` and `MADV_FREE` do nothing; only `MADV_FREE_REUSABLE` moves the ledger. |
 | `pressure-discard` | none | What real pressure does to `MADV_FREE` pages vs plain dirty pages — and how deep pressure has to go before it touches either (see findings). |
-| `hv-reclaim` | none | A live Hypervisor.framework VM whose host reclaims guest RAM: `hv_vm_unmap → madvise(MADV_FREE_REUSABLE) → hv_vm_map`, footprint −3 GiB, VM keeps running. |
+| `hv-reclaim` | none | A live Hypervisor.framework VM whose host reclaims guest RAM: `hv_vm_unmap → madvise(MADV_FREE_REUSABLE) → hv_vm_map`, footprint −3 GiB, VM keeps running. Safety probes: `--pressure-check` (guest parked under pressure) and `--hammer` (guest writes racing the pageout scan). |
 
 ```sh
 cargo run --release -p calibrate-madvise
-cargo run --release -p pressure-discard   # expect ~30s of system sluggishness
-./run.sh                     # hv-reclaim, the fix
-./run.sh --naive             # hv-reclaim, the trap (see below)
-./run.sh --advice free       # what libkrun ships (ledger-flat)
+cargo run --release -p pressure-discard      # expect ~30s of system sluggishness
+./run.sh                          # hv-reclaim, the fix
+./run.sh --naive                  # hv-reclaim, the trap (see below)
+./run.sh --advice free            # what libkrun ships (ledger-flat)
+./run.sh --repeat 5               # variance of the reclaim cycle
+./run.sh --pressure-check --pressure-gb 12   # parked safety probe
+./run.sh --hammer --pressure-gb 12           # concurrent-write race probe
 ```
 
-Measured on macOS 26.4, Apple Silicon (M-series). `phys_footprint` is
-read via `task_info(TASK_VM_INFO)` — the same ledger macOS pressure
-decisions use.
+`phys_footprint` is read via `task_info(TASK_VM_INFO)` — the same ledger
+macOS pressure decisions use. Every pressure run arms a 1 GiB
+`MADV_FREE` **canary** as its positive control: if pressure never
+discards the canary (see the file-cache moat below), the run reports
+itself INCONCLUSIVE instead of printing a vacuous all-clear.
 
-## Results (2026-08-10, macOS 26.4)
+## Results
 
-`calibrate-madvise`, 1 GiB dirty anonymous memory:
+Two machines, labeled throughout:
+
+- **A** — 128 GiB M-series desktop, macOS 26.4
+- **B** — 16 GiB M4 Mac mini, macOS 26.3.1
+
+Ledger effects replicate identically on both. Pressure runs are
+conclusive only on B — on A the canary survives behind the file-cache
+moat and the probes self-report INCONCLUSIVE.
+
+`calibrate-madvise`, 1 GiB dirty anonymous memory (A and B, identical):
 
 | advice | Δfootprint on advise |
 |---|---|
@@ -42,12 +56,23 @@ decisions use.
 | `MADV_FREE` | ±0 |
 | `MADV_FREE_REUSABLE` | **−1024 MiB** |
 
-`hv-reclaim`, 3 GiB guest RAM dirtied by a vCPU, then reclaimed:
+`hv-reclaim`, 3 GiB guest RAM dirtied by a vCPU, then reclaimed (A and
+B, identical; `--repeat 5` gives mean −3073.5 MiB with min = max — the
+ledger step is a deterministic VM operation, not a noisy average):
 
 | sequence | Δfootprint on reclaim |
 |---|---|
 | `madvise(REUSABLE)` while stage-2 mapped (`--naive`) | **±0 — silent no-op** |
 | `hv_vm_unmap → madvise(REUSABLE) → hv_vm_map` | **−3073 MiB** |
+
+Safety probes (machine B, 12 GiB pressure; the canary was conclusive —
+all 65536/65536 canary pages discarded — in every run):
+
+| run | guest during pressure | guest data after |
+|---|---|---|
+| `--pressure-check` | parked at the doorbell | **196608/196608 pages intact** |
+| `--hammer` | RMW-incrementing every page — 9155 full sweeps (~1.8 billion stores) racing the scan through build-up, hold, and release | **196608/196608 pages at the exact expected counter, 0 lost** |
+| `--naive --pressure-check` | parked | **196608/196608 intact; reusable 0 MiB, 273 MiB compressed** — the naive no-op is a *true* no-op: pages stayed in the protected dirty class, they were never lazily armed for discard |
 
 ### Pressure findings
 
@@ -57,26 +82,49 @@ Getting macOS to *actually steal* pages turned out to be its own result:
   it only posts notifications. Any experiment built on `-S` is
   measuring nothing.
 - `memory_pressure -l critical` (real mode) and a 48 GiB dirty-and-hold
-  generator both also reclaimed **zero** of our `MADV_FREE` pages on a
-  128 GiB machine — the entire allocation was absorbed by free memory
-  and ~56 GiB of file cache; the compressor and swap counters did not
+  generator both also reclaimed **zero** of our `MADV_FREE` pages on
+  machine A — the entire allocation was absorbed by free memory and
+  ~56 GiB of file cache; the compressor and swap counters did not
   move. **Anon reclaim begins only after the file-cache slack is
-  drained**, so on big-RAM machines the threshold is enormous.
-- On a 16 GiB M4 (macOS 26.3.1, ~7 GiB slack), a 12 GiB generator run
-  punches through, and the picture is textbook: the 1 GiB `MADV_FREE`
-  buffer was discarded **65536/65536 pages to zero**, while the plain
-  dirty control survived intact — compressed to 1006 MiB and still
-  charged. macOS is perfectly willing to throw away correctly-marked
-  pages; nothing on the Virtualization.framework path ever marks them.
-- **The rogue-page question is answered: guest writes through stage-2
-  reach `pmap_get_refmod`.** After unmap → `MADV_FREE_REUSABLE` → remap
-  and a full guest re-dirty (3 GiB of live data sitting sticky-marked
-  reusable), the same pressure that annihilated the `MADV_FREE` buffer
-  lost **0 of 196608 pages** — the scanner un-marked the re-dirtied
-  pages (reusable 3072 → 2131 MiB, footprint 3.2 → 944 MiB) and
-  compressed them like any live data. The eager-remap reclaim sequence
-  is therefore safe for free-page-reporting semantics; pair re-exposure
-  with `MADV_FREE_REUSE` for prompt accounting, not for correctness.
+  drained**, so on big-RAM machines the threshold is enormous. (This is
+  what the canary exists to catch.)
+- On machine B (~7 GiB slack), a 12 GiB generator run punches through,
+  and the picture is textbook: the 1 GiB `MADV_FREE` buffer was
+  discarded **65536/65536 pages to zero**, while the plain dirty control
+  survived intact — compressed to 1006 MiB and still charged. macOS is
+  perfectly willing to throw away correctly-marked pages; nothing on the
+  Virtualization.framework path ever marks them.
+- **The rogue-page question is answered in both forms.** After
+  unmap → `MADV_FREE_REUSABLE` → remap and a full guest re-dirty (3 GiB
+  of live data sitting sticky-marked reusable), pressure deep enough to
+  annihilate the canary lost **0 of 196608 pages** — with the guest
+  parked (`--pressure-check`), and with the guest actively
+  read-modify-writing every page while the scan ran (`--hammer`: 9155
+  sweeps, every page's counter exact at the end, so a discard at *any*
+  moment of the run would have shown). The ledger shows the scanner
+  un-marking what the guest re-dirtied (hammer run: reusable
+  3072 → 2061 MiB, footprint 3 → 1015 MiB) and compressing it like any
+  live data. Guest writes through stage-2 evidently reach the pmap dirty
+  state the scan consults before discarding. Pair re-exposure with
+  `MADV_FREE_REUSE` for prompt accounting, not for correctness.
+
+## Why "placebo" and not "lazy reclaim"
+
+A footprint-flat balloon could still be doing something real — this
+repo's own findings show `MADV_FREE` is footprint-flat yet genuinely
+discardable, so the ledger alone cannot convict the balloon. The
+distinguishing experiment (in the blog post; measured 2026-07,
+macOS 26.4) put both hypotheses under real pressure: with a 16 GiB VZ
+guest ballooned down by 15.35 GB, the XPC helper's footprint was
+byte-identical before and after inflation — and under sustained host
+pressure the ballooned pages were **compressed as live data**, while an
+`MADV_FREE` control armed in the same experiment was discarded within
+seconds. The balloon fails both tests: no accounting release *and* no
+change of reclaim class. That is a placebo, not deferred reclaim.
+
+Packaging that as a turnkey demo needs a VZ Linux guest and
+`sudo footprint` on Apple's XPC helper — hence `vz-ratchet`'s absence
+below; method and numbers are in the blog post.
 
 ## Findings beyond the blog post
 
@@ -91,20 +139,26 @@ documented anywhere:
    working and ships a reclaim path that reclaims nothing. The stage-2
    mapping must be torn down around the `madvise`.
 
-2. **Reusable state outlives the reclaim — and that turns out to be
-   safe.** After the unmap → advise → remap sequence, pages the guest
-   faults back in and re-dirties are *born unmetered*: resident climbs
-   back to 3 GiB while `phys_footprint` stays near zero and the
-   `reusable` counter absorbs the difference. This stickiness is xnu's
-   lazy ledger — it applies to host writes too, and `vm_pageout_scan`'s
-   rogue-page fix-up un-marks a written page (via `pmap_get_refmod`)
-   before any reclaim decision. Whether *guest* writes through stage-2
-   reach `pmap_get_refmod` was the open safety question;
-   `./run.sh --pressure-check` answered it **positively** on real
-   hardware (see the pressure findings above): 0 pages of guest data
-   lost under pressure deep enough to discard every `MADV_FREE` control
-   page, with the ledger showing the scanner un-marking exactly the
-   re-dirtied range.
+2. **Reusable state outlives the reclaim — and that holds up under
+   concurrent writes.** After the unmap → advise → remap sequence, pages
+   the guest faults back in and re-dirties are *born unmetered*:
+   resident climbs back to 3 GiB while `phys_footprint` stays near zero
+   and the `reusable` counter absorbs the difference. This stickiness is
+   xnu's lazy ledger — it applies to host writes too, and
+   `vm_pageout_scan`'s rogue-page fix-up un-marks a written page before
+   any reclaim decision. Whether *guest* writes through stage-2 reach
+   that dirty state was the open safety question; `--pressure-check`
+   (parked) and `--hammer` (writes racing the scan) both answered it
+   positively on real hardware — see the safety-probe table above.
+
+   Two limits worth stating plainly. The protection rests on scan-time
+   behavior of a private advice flag with no documented contract,
+   observed on two OS builds — treat it as measured behavior, not an API
+   guarantee. And once remapped, guest refaults are invisible to the
+   VMM (stage-2 faults are handled entirely by xnu), so there is no
+   host-side hook from which to issue `MADV_FREE_REUSE`: the sticky
+   accounting state is permanent by construction, which is exactly why
+   the scan-time protection had to be tested this hard.
 
 ## What is deliberately not here (yet)
 
@@ -112,7 +166,8 @@ documented anywhere:
   real Linux guest, footprint sampled on Apple's XPC helper; balloon
   inflation showing a byte-identical footprint). Needs a guest kernel
   and `sudo footprint`; an independent reproduction already exists at
-  [thewesjohnson/macos-virtio-balloon-test](https://github.com/thewesjohnson/macos-virtio-balloon-test).
+  [thewesjohnson/macos-virtio-balloon-test](https://github.com/thewesjohnson/macos-virtio-balloon-test),
+  and the pressure-side discrimination is described above.
 - **libkrun comparison** — libkrun's balloon handles guest free-page
   reports with plain `madvise(MADV_FREE)` on macOS
   ([source](https://github.com/libkrun/libkrun/blob/main/src/devices/src/virtio/balloon/device.rs)),

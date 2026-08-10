@@ -5,6 +5,10 @@
 //! and what `footprint(1)` reports). Everything in this repo is judged
 //! against it.
 
+/// Apple Silicon host page size. Every touch/survey stride in this repo
+/// uses it; [`assert_host_page_size`] pins it at startup.
+pub const PAGE: usize = 16 * 1024;
+
 /// `task_vm_info` up to and including `phys_footprint` (rev1).
 /// Layout from `<mach/task_info.h>`; the kernel copies out at most the
 /// count we pass, so truncating after `phys_footprint` is safe.
@@ -59,7 +63,8 @@ impl Ledger {
     /// measurement tool; a failed reading must never be silently zero.
     pub fn read() -> Self {
         let mut info = TaskVmInfo::default();
-        let mut count = (size_of::<TaskVmInfo>() / size_of::<u32>()) as u32;
+        let full = (size_of::<TaskVmInfo>() / size_of::<u32>()) as u32;
+        let mut count = full;
         let kr = unsafe {
             task_info(
                 mach_task_self_,
@@ -69,6 +74,9 @@ impl Ledger {
             )
         };
         assert_eq!(kr, 0, "task_info(TASK_VM_INFO) failed: {kr}");
+        // The kernel writes back how many words it copied; anything short
+        // of the full struct would leave `phys_footprint` as stale zeros.
+        assert_eq!(count, full, "task_info copied {count} of {full} words");
         Self {
             phys_footprint: info.phys_footprint,
             resident: info.resident_size,
@@ -78,7 +86,15 @@ impl Ledger {
     }
 }
 
+pub mod canary;
 pub mod pressure;
+
+/// Assert the host page size matches [`PAGE`]. On a hypothetical 4 KiB
+/// host the 16 KiB strides would silently skip pages; fail loudly instead.
+pub fn assert_host_page_size() {
+    let sys = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert_eq!(sys as usize, PAGE, "host page size {sys} != {PAGE}");
+}
 
 /// Bytes → mebibytes, for display.
 pub fn mib(bytes: u64) -> f64 {
