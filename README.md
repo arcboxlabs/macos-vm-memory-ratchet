@@ -115,9 +115,10 @@ Getting macOS to *actually steal* pages turned out to be its own result:
   moment of the run would have shown). The ledger shows the scanner
   un-marking what the guest re-dirtied (hammer run: reusable
   3072 → 2061 MiB, footprint 3 → 1015 MiB) and compressing it like any
-  live data. Guest writes through stage-2 evidently reach the pmap dirty
-  state the scan consults before discarding. Pair re-exposure with
-  `MADV_FREE_REUSE` for prompt accounting, not for correctness.
+  live data. Why the data survives is traced through kernel source in
+  "What the xnu source says" below — the protection is layered and
+  starts earlier than the scan. Pair re-exposure with `MADV_FREE_REUSE`
+  for prompt accounting, not for correctness.
 
 ## Why "placebo" and not "lazy reclaim"
 
@@ -164,10 +165,11 @@ documented anywhere:
    and the `reusable` counter absorbs the difference. This stickiness is
    xnu's lazy ledger — it applies to host writes too, and
    `vm_pageout_scan`'s rogue-page fix-up un-marks a written page before
-   any reclaim decision. Whether *guest* writes through stage-2 reach
-   that dirty state was the open safety question; `--pressure-check`
-   (parked) and `--hammer` (writes racing the scan) both answered it
-   positively on real hardware — see the safety-probe table above.
+   any reclaim decision. Whether *guest* writes are protected the same
+   way was the open safety question; `--pressure-check` (parked) and
+   `--hammer` (writes racing the scan) both answered it positively on
+   real hardware — see the safety-probe table above, and the source
+   trace below for the mechanism.
 
    Two limits worth stating plainly. The protection rests on scan-time
    behavior of a private advice flag with no documented contract,
@@ -177,6 +179,70 @@ documented anywhere:
    host-side hook from which to issue `MADV_FREE_REUSE`: the sticky
    accounting state is permanent by construction, which is exactly why
    the scan-time protection had to be tested this hard.
+
+## What the xnu source says
+
+The behaviors above are measurable but documented nowhere, so we traced
+them through the public kernel source
+([apple-oss-distributions/xnu](https://github.com/apple-oss-distributions/xnu)
+at [`xnu-12377.1.9`](https://github.com/apple-oss-distributions/xnu/tree/xnu-12377.1.9),
+the macOS 26-era drop). Line references are to that tag; measured
+behavior remains the authority where the code is closed.
+
+- **Why the no-op is silent.** `madvise(MADV_FREE_REUSABLE)` lands in
+  `vm_map_reusable_pages` → `vm_object_deactivate_pages`, whose per-page
+  gate skips any page that is wired, private, gobbled, busy, laundering,
+  cleaning, or queued to be freed
+  ([`vm_object.c:2352`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/vm/vm_object.c#L2352))
+  — and the walk then counts the call as a success and returns
+  `KERN_SUCCESS` regardless
+  ([`vm_map.c:17272`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/vm/vm_map.c#L17272)).
+  A skipped page is indistinguishable, at the syscall boundary, from a
+  reclaimed one.
+- **Where the footprint actually moves.** The ledger transfer — credit
+  `reusable`, debit `internal` and `phys_footprint` — happens in the
+  arm64 pmap layer
+  ([`pmap.c:8111-8120`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/arm/pmap/pmap.c#L8111-L8120)),
+  reached only for pages the walk actually marks.
+- **The guest-dirty trap is the wired-page gate — as far as public code
+  can say.** There is no hypervisor special-casing anywhere on this
+  path: the complete PV-list flag inventory
+  ([`pmap_data.h:160-286`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/arm/pmap/pmap_data.h#L160-L286))
+  has IOMMU flags but nothing HV-related, and the host side of
+  Hypervisor.framework is a 264-line trap shim
+  ([`hv_support_kext.c`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/hv_support_kext.c))
+  — the real implementation is the closed AppleHV kext (and on M3+ the
+  page tables belong to SPTM, whose interface header is referenced but
+  not shipped). What the source *does* show is that `VM_PAGE_WIRED`
+  silently excludes a page from reusable marking. Every observation in
+  this repo is predicted if AppleHV wires each page on its first guest
+  stage-2 fault: guest-dirtied pages are wired (skipped, ledger
+  pinned), host-dirtied pages the guest never touched are not (reclaim
+  works), and `hv_vm_unmap` unwires (the same `madvise` then works).
+- **Why re-dirtied reusable pages survive pressure.** Not the mechanism
+  we first assumed: `pmap_get_refmod` aggregates only CPU-mapping
+  attribute bits and the pageout consult sites gate on `vmp_pmapped`
+  ([`vm_pageout.c:3572-3586`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/vm/vm_pageout.c#L3572-L3586)),
+  so stage-2 dirty state as such never reaches the scan. Under the
+  wiring model the protection is simpler and stronger: a re-faulted
+  (re-wired) guest page is not on the pageable queues at all. Behind
+  it sit two more layers — the scan un-marks any reusable page it
+  finds referenced or dirty
+  ([`VM_PAGEOUT_SCAN_HANDLE_REUSABLE_PAGE`, `vm_pageout.c:1572-1590`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/vm/vm_pageout.c#L1572-L1590)),
+  and it refuses to free a page whose final `pmap_disconnect` reports
+  `VM_MEM_MODIFIED`, compressing it instead
+  ([`vm_pageout.c:3801-3818`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/vm/vm_pageout.c#L3801-L3818)).
+  Losing live data would require a page that is simultaneously
+  unwired, unmapped, and unmodified in every mapping the host can see;
+  the `--hammer` run shows the sum of these protections holding under
+  fire. One wrinkle the public source does not explain: plain
+  `vm_page_wire` un-marks reusable pages and re-credits the footprint
+  ([`vm_resident.c:5440-5459`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/vm/vm_resident.c#L5440-L5459)
+  makes wired and reusable mutually exclusive), yet our ledger shows a
+  guest re-touch leaving the `reusable` counter in place — whatever
+  wiring path AppleHV uses skips that accounting. The sticky-reusable
+  ledger anomaly therefore lives in closed code; the data-safety
+  result does not depend on resolving it.
 
 ## What is deliberately not here (yet)
 
