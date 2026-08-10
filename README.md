@@ -19,6 +19,7 @@ Developer ID — the hypervisor demo is ad-hoc signed.
 | `calibrate-madvise` | none | What each `madvise` advice does to `phys_footprint`: `MADV_DONTNEED` and `MADV_FREE` do nothing; only `MADV_FREE_REUSABLE` moves the ledger. |
 | `pressure-discard` | none | What real pressure does to `MADV_FREE` pages vs plain dirty pages — and how deep pressure has to go before it touches either (see findings). |
 | `hv-reclaim` | none | A live Hypervisor.framework VM whose host reclaims guest RAM: `hv_vm_unmap → madvise(MADV_FREE_REUSABLE) → hv_vm_map`, footprint −3 GiB, VM keeps running. Safety probes: `--pressure-check` (guest parked under pressure) and `--hammer` (guest writes racing the pageout scan). |
+| `vz-ratchet` | none | The Virtualization.framework side, live: a real Linux guest touches N GiB (helper footprint +N), frees it (footprint unmoved — the ratchet), the balloon inflates (guest visibly starves, footprint unmoved — the placebo), and under real pressure the surrendered pages are compressed, not discarded, while an `MADV_FREE` canary dies. |
 
 ```sh
 cargo run --release -p calibrate-madvise
@@ -29,7 +30,17 @@ cargo run --release -p pressure-discard      # expect ~30s of system sluggishnes
 ./run.sh --repeat 5               # variance of the reclaim cycle
 ./run.sh --pressure-check --pressure-gb 12   # parked safety probe
 ./run.sh --hammer --pressure-gb 12           # concurrent-write race probe
+./run-vz.sh                       # vz-ratchet: ratchet + balloon placebo
+./run-vz.sh --guest-gb 4 --touch-gb 3 --pressure-gb 12   # + discrimination
 ```
+
+`vz-ratchet` boots a pinned ArcBox kernel (fetched once from the public
+boot CDN; any VZ-bootable arm64 kernel with virtio-console and
+virtio-balloon built in works via `VZ_RATCHET_KERNEL`), a ~400 KiB
+initramfs whose `/init` is a static Rust binary driven over serial, and
+samples Apple's `com.apple.Virtualization.VirtualMachine` XPC helper —
+the process that owns guest RAM on VZ — with `proc_pid_rusage`, which
+needs **no root** even against Apple's hardened helper.
 
 `phys_footprint` is read via `task_info(TASK_VM_INFO)` — the same ledger
 macOS pressure decisions use. Every pressure run arms a 1 GiB
@@ -113,18 +124,25 @@ Getting macOS to *actually steal* pages turned out to be its own result:
 A footprint-flat balloon could still be doing something real — this
 repo's own findings show `MADV_FREE` is footprint-flat yet genuinely
 discardable, so the ledger alone cannot convict the balloon. The
-distinguishing experiment (in the blog post; measured 2026-07,
-macOS 26.4) put both hypotheses under real pressure: with a 16 GiB VZ
-guest ballooned down by 15.35 GB, the XPC helper's footprint was
-byte-identical before and after inflation — and under sustained host
-pressure the ballooned pages were **compressed as live data**, while an
-`MADV_FREE` control armed in the same experiment was discarded within
-seconds. The balloon fails both tests: no accounting release *and* no
-change of reclaim class. That is a placebo, not deferred reclaim.
+distinguishing experiment must put both hypotheses under real pressure,
+and `vz-ratchet` runs it end to end (machine B, 4 GiB guest, 3 GiB
+touched, 12 GiB pressure):
 
-Packaging that as a turnkey demo needs a VZ Linux guest and
-`sudo footprint` on Apple's XPC helper — hence `vz-ratchet`'s absence
-below; method and numbers are in the blog post.
+| step | guest `MemAvailable` | helper footprint |
+|---|---|---|
+| VM booted, guest idle | — | 205 MiB |
+| guest touches 3 GiB | — | 3284 MiB |
+| guest frees every byte | 3705 MiB | 3284 MiB — **the ratchet** |
+| balloon inflates 3 GiB | **639 MiB** — the guest really handed the pages over | 3284 MiB — **the placebo** |
+| 12 GiB real pressure | — | **3285 MiB (−0.0)** while the 1 GiB `MADV_FREE` canary is discarded 65536/65536 and helper *resident* drops ~600 MiB (compressed, still charged) |
+
+The balloon fails both tests: no accounting release when it inflates,
+*and* no change of reclaim class — pressure deep enough to annihilate
+every correctly-marked control page compresses the surrendered pages
+instead of discarding them. That is a placebo, not deferred reclaim.
+(The larger original measurement — 15.35 GB ballooned on a 16 GiB
+guest, byte-identical footprint, macOS 26.4 — is in the blog post; this
+repo's version is the turnkey reproduction.)
 
 ## Findings beyond the blog post
 
@@ -162,17 +180,13 @@ documented anywhere:
 
 ## What is deliberately not here (yet)
 
-- **`vz-ratchet`** — the Virtualization.framework side (alloc/free in a
-  real Linux guest, footprint sampled on Apple's XPC helper; balloon
-  inflation showing a byte-identical footprint). Needs a guest kernel
-  and `sudo footprint`; an independent reproduction already exists at
-  [thewesjohnson/macos-virtio-balloon-test](https://github.com/thewesjohnson/macos-virtio-balloon-test),
-  and the pressure-side discrimination is described above.
 - **libkrun comparison** — libkrun's balloon handles guest free-page
   reports with plain `madvise(MADV_FREE)` on macOS
   ([source](https://github.com/libkrun/libkrun/blob/main/src/devices/src/virtio/balloon/device.rs)),
   which per `calibrate-madvise` never moves the ledger — pressure
-  relief, not visible reclaim.
+  relief, not visible reclaim. (An independent balloon reproduction
+  also exists at
+  [thewesjohnson/macos-virtio-balloon-test](https://github.com/thewesjohnson/macos-virtio-balloon-test).)
 
 ## License
 

@@ -38,3 +38,11 @@ dependencies = [
  "ledger",
  "libc",
 ]
+
+[[package]]
+name = "vz-ratchet"
+version = "0.1.0"
+dependencies = [
+ "ledger",
+ "libc",
+]

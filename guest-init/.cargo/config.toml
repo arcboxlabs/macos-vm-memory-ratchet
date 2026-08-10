@@ -1,0 +1,6 @@
+# Static aarch64 musl binary with no external cross-toolchain: rustc
+# resolves "rust-lld" from its own sysroot, and the musl target links its
+# bundled libc. `rustup target add aarch64-unknown-linux-musl` is all a
+# reproducer needs.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

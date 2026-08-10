@@ -5,7 +5,10 @@ members = [
     "crates/calibrate-madvise",
     "crates/pressure-discard",
     "crates/hv-reclaim",
+    "crates/vz-ratchet",
 ]
+# The guest /init is musl-only; run-vz.sh builds it standalone.
+exclude = ["guest-init"]
 
 [workspace.package]
 edition = "2021"
