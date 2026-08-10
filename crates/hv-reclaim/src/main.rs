@@ -47,6 +47,7 @@
 //! ./run.sh --repeat 5     # variance of the reclaim cycle
 //! ```
 
+mod fleet_sim;
 mod guest;
 mod hvf;
 mod timing;
@@ -112,6 +113,11 @@ struct Options {
     /// Reuse the same mapping across timing cycles instead of resetting to
     /// fresh memory (--steady-state).
     steady_state: bool,
+    /// The workload-shaped E3 run (--fleet-sim): K per-service regions,
+    /// dirtied on start, reclaimed on stop, 1 Hz trace output.
+    fleet_sim: bool,
+    services: usize,
+    service_mib: usize,
 }
 
 fn parse_args() -> Options {
@@ -129,6 +135,9 @@ fn parse_args() -> Options {
         extent_kb: 0,
         reclaim_mode: ReclaimMode::Reusable,
         steady_state: false,
+        fleet_sim: false,
+        services: 8,
+        service_mib: 256,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -179,6 +188,21 @@ fn parse_args() -> Options {
                 }
             }
             "--steady-state" => opts.steady_state = true,
+            "--fleet-sim" => opts.fleet_sim = true,
+            "--services" => {
+                opts.services = args
+                    .next()
+                    .expect("--services N")
+                    .parse()
+                    .expect("integer count");
+            }
+            "--service-mib" => {
+                opts.service_mib = args
+                    .next()
+                    .expect("--service-mib N")
+                    .parse()
+                    .expect("integer MiB");
+            }
             other => panic!("unknown argument {other:?}"),
         }
     }
@@ -196,11 +220,15 @@ fn parse_args() -> Options {
              probes separately"
         );
     }
-    if opts.time_reclaim {
+    if opts.time_reclaim || opts.fleet_sim {
         assert!(
             !opts.naive && !opts.host_touch && !opts.pressure_check && !opts.hammer,
-            "--time-reclaim measures the working sequence; it excludes \
-             --naive, --host-touch and the safety probes"
+            "--time-reclaim/--fleet-sim measure the working sequence; they \
+             exclude --naive, --host-touch and the safety probes"
+        );
+        assert!(
+            !(opts.time_reclaim && opts.fleet_sim),
+            "--time-reclaim and --fleet-sim are separate modes"
         );
     } else {
         assert!(
@@ -256,7 +284,7 @@ fn main() {
     let ram_size = opts.size_gb << 30;
     let pages = ram_size / PAGE;
 
-    if !opts.time_reclaim {
+    if !opts.time_reclaim && !opts.fleet_sim {
         println!(
             "hv-reclaim: {} GiB guest RAM in-process, dirtied by {},\n\
              reclaimed with {}\n",
@@ -308,8 +336,12 @@ fn main() {
         "set CPSR",
     );
 
-    if opts.time_reclaim {
-        ram = timing::run(vcpu, exit, ram, &opts);
+    if opts.time_reclaim || opts.fleet_sim {
+        if opts.time_reclaim {
+            ram = timing::run(vcpu, exit, ram, &opts);
+        } else {
+            fleet_sim::run(vcpu, exit, ram, &opts);
+        }
         check(unsafe { hv_vcpu_destroy(vcpu) }, "hv_vcpu_destroy");
         check(unsafe { hv_vm_destroy() }, "hv_vm_destroy");
         unsafe {

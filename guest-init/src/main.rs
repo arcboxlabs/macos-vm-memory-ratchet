@@ -2,10 +2,18 @@
 //! console. The host drives it line-by-line over serial:
 //!
 //! ```text
-//! touch N   ->  RATCHET TOUCHED N   (mmap N GiB anon, write every 4 KiB)
-//! free      ->  RATCHET FREED       (munmap everything held)
-//! mem       ->  RATCHET MEM <kib>   (MemAvailable from /proc/meminfo)
+//! touch N          ->  RATCHET TOUCHED N        (mmap N GiB anon, write every 4 KiB)
+//! free             ->  RATCHET FREED            (munmap everything held)
+//! mem              ->  RATCHET MEM <kib>        (MemAvailable from /proc/meminfo)
+//! fleet start K M  ->  RATCHET FLEET-STARTED K  (fork K children, M MiB dirty each)
+//! fleet stop-one   ->  RATCHET FLEET-STOPPED <left>  (SIGKILL + reap one child)
+//! fleet stop       ->  RATCHET FLEET-STOPPED 0  (stop every remaining child)
 //! ```
+//!
+//! Fleet children model services: each forks, dirties its own M MiB, then
+//! keeps a rotating eighth of it warm. Stopping one is a SIGKILL — the
+//! exact path a stopped container takes; the guest kernel frees the
+//! process's anonymous pages on exit.
 //!
 //! It prints `RATCHET READY` once the console is open. Kernel log lines
 //! share the same serial channel; the host filters on the `RATCHET `
@@ -64,6 +72,44 @@ fn mem_available_kib() -> u64 {
     panic!("MemAvailable not in /proc/meminfo");
 }
 
+/// Service stand-in: dirty `mib` MiB, then keep a rotating eighth warm.
+/// Runs in a forked child; must not touch the console or allocate.
+fn fleet_child(mib: usize) -> ! {
+    let size = mib << 20;
+    // SAFETY: fresh anonymous mapping request in the child.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        // SAFETY: child exit without running parent atexit state.
+        unsafe { libc::_exit(1) };
+    }
+    let base = ptr.cast::<u8>();
+    for off in (0..size).step_by(STRIDE) {
+        // SAFETY: off < size, mapping is writable.
+        unsafe { base.add(off).write(0xA5) };
+    }
+    let slice = size / 8;
+    let mut slot = 0usize;
+    loop {
+        let start = slot * slice;
+        for off in (start..start + slice).step_by(STRIDE) {
+            // SAFETY: off < size by construction.
+            unsafe { base.add(off).write(0x5A) };
+        }
+        slot = (slot + 1) % 8;
+        // SAFETY: plain sleep in the child.
+        unsafe { libc::usleep(500_000) };
+    }
+}
+
 fn main() {
     mount("devtmpfs", "/dev");
     mount("proc", "/proc");
@@ -71,6 +117,7 @@ fn main() {
     let mut out = open_console(true);
     let input = open_console(false);
     let mut held: Vec<(*mut libc::c_void, usize)> = Vec::new();
+    let mut fleet: Vec<libc::pid_t> = Vec::new();
 
     writeln!(out, "RATCHET READY").unwrap();
     for line in BufReader::new(input).lines() {
@@ -108,6 +155,29 @@ fn main() {
             "FREED".to_string()
         } else if line == "mem" {
             format!("MEM {}", mem_available_kib())
+        } else if let Some(rest) = line.strip_prefix("fleet start ") {
+            let mut it = rest.split_whitespace();
+            let k: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let mib: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            for _ in 0..k {
+                // SAFETY: the child calls only async-signal-safe libc.
+                match unsafe { libc::fork() } {
+                    -1 => panic!("fork: {}", std::io::Error::last_os_error()),
+                    0 => fleet_child(mib),
+                    pid => fleet.push(pid),
+                }
+            }
+            format!("FLEET-STARTED {}", fleet.len())
+        } else if line == "fleet stop-one" || line == "fleet stop" {
+            let stop = if line == "fleet stop" { fleet.len() } else { 1 };
+            for pid in fleet.drain(..stop) {
+                // SAFETY: pid is a child we forked.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+                }
+            }
+            format!("FLEET-STOPPED {}", fleet.len())
         } else {
             format!("ERR unknown command: {line}")
         };

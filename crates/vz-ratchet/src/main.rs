@@ -21,6 +21,7 @@
 //! Run via `./run-vz.sh` (builds the guest init, the Swift harness, and
 //! fetches the pinned guest kernel).
 
+mod fleet;
 mod harness;
 mod helper;
 
@@ -43,6 +44,10 @@ struct Options {
     touch_gb: usize,
     pressure_gb: usize,
     verbose: bool,
+    /// The workload-shaped E3 run (--fleet), K services of --service-mib.
+    fleet: bool,
+    services: usize,
+    service_mib: usize,
 }
 
 fn parse_args() -> Options {
@@ -54,6 +59,9 @@ fn parse_args() -> Options {
         touch_gb: 4,
         pressure_gb: 0,
         verbose: false,
+        fleet: false,
+        services: 8,
+        service_mib: 256,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -68,6 +76,13 @@ fn parse_args() -> Options {
                 opts.pressure_gb = value("--pressure-gb").parse().expect("integer GiB");
             }
             "--verbose" => opts.verbose = true,
+            "--fleet" => opts.fleet = true,
+            "--services" => {
+                opts.services = value("--services").parse().expect("integer count");
+            }
+            "--service-mib" => {
+                opts.service_mib = value("--service-mib").parse().expect("integer MiB");
+            }
             other => panic!("unknown argument {other:?}"),
         }
     }
@@ -76,7 +91,7 @@ fn parse_args() -> Options {
         "--harness/--kernel/--initramfs are required (use ./run-vz.sh)"
     );
     assert!(
-        opts.touch_gb < opts.guest_gb,
+        opts.fleet || opts.touch_gb < opts.guest_gb,
         "--touch-gb must leave the guest room to run"
     );
     opts
@@ -105,6 +120,23 @@ fn main() {
     vm.wait("RATCHET READY", BOOT_TIMEOUT);
     let pid = helper::find_new_helper(&pre_existing, Duration::from_secs(10));
     println!("\nguest up; sampling XPC helper pid {pid}\n");
+
+    if opts.fleet {
+        assert!(
+            opts.services * opts.service_mib < opts.guest_gb * 1024,
+            "fleet must fit in the guest"
+        );
+        fleet::run(
+            vm,
+            pid,
+            &fleet::FleetOptions {
+                services: opts.services,
+                service_mib: opts.service_mib,
+                guest_gb: opts.guest_gb,
+            },
+        );
+        return;
+    }
 
     let baseline = helper::sample(pid);
     helper::row("VM booted, guest idle", &baseline);

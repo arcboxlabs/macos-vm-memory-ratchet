@@ -126,16 +126,21 @@ fn read_reg(vcpu: u64, reg: u32) -> u64 {
 
 /// Arm the guest registers for one full touch pass and run to the doorbell.
 pub fn run_touch_pass(vcpu: u64, exit: *const HvVcpuExitInfo, ram_size: usize) {
+    run_touch_range(vcpu, exit, 0, ram_size);
+}
+
+/// Touch pass over a sub-range of guest RAM, `[start_off, end_off)`.
+pub fn run_touch_range(vcpu: u64, exit: *const HvVcpuExitInfo, start_off: usize, end_off: usize) {
     check(
         unsafe { hv_vcpu_set_reg(vcpu, HV_REG_PC, CODE_GPA) },
         "set PC",
     );
     check(
-        unsafe { hv_vcpu_set_reg(vcpu, HV_REG_X1, RAM_GPA) },
+        unsafe { hv_vcpu_set_reg(vcpu, HV_REG_X1, RAM_GPA + start_off as u64) },
         "set X1",
     );
     check(
-        unsafe { hv_vcpu_set_reg(vcpu, HV_REG_X2, RAM_GPA + ram_size as u64) },
+        unsafe { hv_vcpu_set_reg(vcpu, HV_REG_X2, RAM_GPA + end_off as u64) },
         "set X2",
     );
     check(
