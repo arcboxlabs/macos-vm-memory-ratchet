@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ledger",
+    "crates/calibrate-madvise",
+    "crates/pressure-discard",
+    "crates/hv-reclaim",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arcboxlabs/macos-vm-memory-ratchet"
+
+[workspace.dependencies]
+libc = "0.2"
+ledger = { path = "crates/ledger" }
+
+[profile.release]
+debug = true
