@@ -56,6 +56,9 @@ pub struct Ledger {
     pub reusable: u64,
     /// Bytes held by the compressor on this task's behalf.
     pub compressed: u64,
+    /// vm-map entry count for the task (what `vmmap` totals as regions).
+    /// Growth here is the fragmentation cost of per-extent map surgery.
+    pub regions: i32,
 }
 
 impl Ledger {
@@ -82,6 +85,7 @@ impl Ledger {
             resident: info.resident_size,
             reusable: info.reusable,
             compressed: info.compressed,
+            regions: info.region_count,
         }
     }
 }

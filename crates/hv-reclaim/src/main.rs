@@ -49,6 +49,7 @@
 
 mod guest;
 mod hvf;
+mod timing;
 
 use guest::{run_hammer, run_touch_pass, write_code_page, CODE_GPA, RAM_GPA};
 use hvf::{
@@ -66,6 +67,22 @@ use std::time::{Duration, Instant};
 const HOLD: Duration = Duration::from_secs(8);
 /// Post-release tail during which the hammer keeps sweeping.
 const TAIL: Duration = Duration::from_secs(2);
+
+/// How `--time-reclaim` gives an extent back to the OS (see `timing`).
+#[derive(Clone, Copy, PartialEq)]
+enum ReclaimMode {
+    Reusable,
+    Munmap,
+}
+
+impl ReclaimMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Reusable => "reusable",
+            Self::Munmap => "munmap",
+        }
+    }
+}
 
 struct Options {
     advice: i32,
@@ -85,6 +102,16 @@ struct Options {
     pressure_gb: usize,
     /// Repetitions of the dirty→reclaim cycle (--repeat).
     repeat: usize,
+    /// Per-phase cost measurement with CSV output (--time-reclaim).
+    time_reclaim: bool,
+    /// Extent size for the timing matrix, KiB; 0 = the whole range as one
+    /// extent (--extent-kb).
+    extent_kb: usize,
+    /// Which release step the timing triple uses (--reclaim-mode).
+    reclaim_mode: ReclaimMode,
+    /// Reuse the same mapping across timing cycles instead of resetting to
+    /// fresh memory (--steady-state).
+    steady_state: bool,
 }
 
 fn parse_args() -> Options {
@@ -98,6 +125,10 @@ fn parse_args() -> Options {
         hammer: false,
         pressure_gb: 48,
         repeat: 1,
+        time_reclaim: false,
+        extent_kb: 0,
+        reclaim_mode: ReclaimMode::Reusable,
+        steady_state: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -132,6 +163,22 @@ fn parse_args() -> Options {
                 opts.repeat = args.next().expect("--repeat N").parse().expect("integer");
                 assert!(opts.repeat >= 1, "--repeat must be >= 1");
             }
+            "--time-reclaim" => opts.time_reclaim = true,
+            "--extent-kb" => {
+                opts.extent_kb = args
+                    .next()
+                    .expect("--extent-kb N")
+                    .parse()
+                    .expect("integer KiB");
+            }
+            "--reclaim-mode" => {
+                opts.reclaim_mode = match args.next().as_deref() {
+                    Some("reusable") => ReclaimMode::Reusable,
+                    Some("munmap") => ReclaimMode::Munmap,
+                    other => panic!("unknown reclaim mode {other:?} (reusable|munmap)"),
+                }
+            }
+            "--steady-state" => opts.steady_state = true,
             other => panic!("unknown argument {other:?}"),
         }
     }
@@ -147,6 +194,19 @@ fn parse_args() -> Options {
             !opts.pressure_check && !opts.hammer,
             "--repeat measures the plain reclaim cycle; run the safety \
              probes separately"
+        );
+    }
+    if opts.time_reclaim {
+        assert!(
+            !opts.naive && !opts.host_touch && !opts.pressure_check && !opts.hammer,
+            "--time-reclaim measures the working sequence; it excludes \
+             --naive, --host-touch and the safety probes"
+        );
+    } else {
+        assert!(
+            opts.extent_kb == 0 && !opts.steady_state && opts.reclaim_mode == ReclaimMode::Reusable,
+            "--extent-kb, --steady-state and --reclaim-mode only apply to \
+             --time-reclaim"
         );
     }
     opts
@@ -196,26 +256,28 @@ fn main() {
     let ram_size = opts.size_gb << 30;
     let pages = ram_size / PAGE;
 
-    println!(
-        "hv-reclaim: {} GiB guest RAM in-process, dirtied by {},\n\
-         reclaimed with {}\n",
-        opts.size_gb,
-        if opts.host_touch {
-            "the HOST (control)"
-        } else {
-            "the guest on a real vCPU"
-        },
-        if opts.naive {
-            format!("{} while still stage-2 mapped (--naive)", opts.advice_name)
-        } else {
-            format!(
-                "hv_vm_unmap \u{2192} {} \u{2192} hv_vm_map",
-                opts.advice_name
-            )
-        },
-    );
+    if !opts.time_reclaim {
+        println!(
+            "hv-reclaim: {} GiB guest RAM in-process, dirtied by {},\n\
+             reclaimed with {}\n",
+            opts.size_gb,
+            if opts.host_touch {
+                "the HOST (control)"
+            } else {
+                "the guest on a real vCPU"
+            },
+            if opts.naive {
+                format!("{} while still stage-2 mapped (--naive)", opts.advice_name)
+            } else {
+                format!(
+                    "hv_vm_unmap \u{2192} {} \u{2192} hv_vm_map",
+                    opts.advice_name
+                )
+            },
+        );
 
-    row("baseline", &Ledger::read());
+        row("baseline", &Ledger::read());
+    }
 
     // Guest RAM and code are plain anonymous memory of this process.
     let mut ram = mmap_anon(ram_size);
@@ -245,6 +307,17 @@ fn main() {
         unsafe { hv_vcpu_set_reg(vcpu, HV_REG_CPSR, PSTATE_EL1H_MASKED) },
         "set CPSR",
     );
+
+    if opts.time_reclaim {
+        ram = timing::run(vcpu, exit, ram, &opts);
+        check(unsafe { hv_vcpu_destroy(vcpu) }, "hv_vcpu_destroy");
+        check(unsafe { hv_vm_destroy() }, "hv_vm_destroy");
+        unsafe {
+            libc::munmap(ram.cast(), ram_size);
+            libc::munmap(code.cast(), PAGE);
+        }
+        return;
+    }
 
     // Dirty → reclaim, `--repeat` times. Each cycle gets FRESH anonymous
     // memory: re-touching reclaimed pages leaves them in the sticky

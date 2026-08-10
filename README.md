@@ -18,7 +18,7 @@ Developer ID — the hypervisor demo is ad-hoc signed.
 |---|---|---|
 | `calibrate-madvise` | none | What each `madvise` advice does to `phys_footprint`: `MADV_DONTNEED` and `MADV_FREE` do nothing; only `MADV_FREE_REUSABLE` moves the ledger. |
 | `pressure-discard` | none | What real pressure does to `MADV_FREE` pages vs plain dirty pages — and how deep pressure has to go before it touches either (see findings). |
-| `hv-reclaim` | none | A live Hypervisor.framework VM whose host reclaims guest RAM: `hv_vm_unmap → madvise(MADV_FREE_REUSABLE) → hv_vm_map`, footprint −3 GiB, VM keeps running. Safety probes: `--pressure-check` (guest parked under pressure) and `--hammer` (guest writes racing the pageout scan). |
+| `hv-reclaim` | none | A live Hypervisor.framework VM whose host reclaims guest RAM: `hv_vm_unmap → madvise(MADV_FREE_REUSABLE) → hv_vm_map`, footprint −3 GiB, VM keeps running. Safety probes: `--pressure-check` (guest parked under pressure) and `--hammer` (guest writes racing the pageout scan). Cost measurement: `--time-reclaim` (per-phase CSV; `--extent-kb` for scattered extents, `--reclaim-mode munmap` for the `munmap`+`MAP_FIXED` alternative, `--steady-state` for the repeated-cycle regime). |
 | `vz-ratchet` | none | The Virtualization.framework side, live: a real Linux guest touches N GiB (helper footprint +N), frees it (footprint unmoved — the ratchet), the balloon inflates (guest visibly starves, footprint unmoved — the placebo), and under real pressure the surrendered pages are compressed, not discarded, while an `MADV_FREE` canary dies. |
 
 ```sh
@@ -30,6 +30,9 @@ cargo run --release -p pressure-discard      # expect ~30s of system sluggishnes
 ./run.sh --repeat 5               # variance of the reclaim cycle
 ./run.sh --pressure-check --pressure-gb 12   # parked safety probe
 ./run.sh --hammer --pressure-gb 12           # concurrent-write race probe
+./run.sh --time-reclaim --extent-kb 2048 --repeat 5          # cost, CSV
+./run.sh --time-reclaim --reclaim-mode munmap --extent-kb 2048   # alternative
+./run.sh --time-reclaim --extent-kb 2048 --steady-state --repeat 10
 ./run-vz.sh                       # vz-ratchet: ratchet + balloon placebo
 ./run-vz.sh --guest-gb 4 --touch-gb 3 --pressure-gb 12   # + discrimination
 ```
