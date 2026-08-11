@@ -3,7 +3,7 @@
 use crate::hvf::{
     check, hv_vcpu_get_reg, hv_vcpu_run, hv_vcpu_set_reg, HvVcpuExitInfo, EC_DATA_ABORT_LOWER_EL,
     HV_EXIT_REASON_CANCELED, HV_EXIT_REASON_EXCEPTION, HV_REG_PC, HV_REG_X1, HV_REG_X2, HV_REG_X3,
-    HV_REG_X4, HV_REG_X6,
+    HV_REG_X4, HV_REG_X5, HV_REG_X6,
 };
 use ledger::PAGE;
 
@@ -90,8 +90,76 @@ const READ_CODE: [u32; 7] = [
     0x17FF_FFFF, // b halt
 ];
 
+/// Guest-side integrity check: compare the first word of every host page
+/// in a range against an expected value and count the mismatches, without
+/// the host ever reading the pages.
+///
+/// Host-side verification would defeat a long-running probe: reading guest
+/// RAM through the host mapping makes the pages host-referenced, which is
+/// exactly the state that makes the pageout scan spare them. The guest
+/// checking its own memory leaves the pages in the state under test.
+///
+/// x1 = cursor, x2 = end, x3 = doorbell, x5 = expected, x4 = mismatches.
+///
+/// ```text
+/// loop: ldr x6, [x1]
+///       cmp x6, x5
+///       b.eq ok
+///       add x4, x4, #1
+/// ok:   add x1, x1, #4, lsl 12
+///       cmp x1, x2
+///       b.lo loop
+///       str x4, [x3]           ; doorbell; x4 carries the verdict
+/// halt: wfi
+///       b halt
+/// ```
+const VERIFY_CODE: [u32; 10] = [
+    0xF940_0026, // ldr x6, [x1]
+    0xEB05_00DF, // cmp x6, x5
+    0x5400_0040, // b.eq ok
+    0x9100_0484, // add x4, x4, #1
+    0x9140_1021, // ok: add x1, x1, #4, lsl #12
+    0xEB02_003F, // cmp x1, x2
+    0x54FF_FF43, // b.lo loop
+    0xF900_0064, // str x4, [x3]
+    0xD503_207F, // wfi
+    0x17FF_FFFF, // b halt
+];
+
+/// Stamp an absolute value into the first word of every host page in a
+/// range. Needed because a reclaimed range does *not* come back zeroed:
+/// `MADV_FREE_REUSABLE` means "you may take these", and pages nobody took
+/// still hold the guest's old data after the remap. An
+/// increment-from-unknown check would therefore be checking nothing; a
+/// caller that wants a known state must write one.
+///
+/// x1 = cursor, x2 = end, x3 = doorbell, x5 = value.
+///
+/// ```text
+/// loop: str x5, [x1]
+///       add x1, x1, #4, lsl 12
+///       cmp x1, x2
+///       b.lo loop
+///       str xzr, [x3]
+/// halt: wfi
+///       b halt
+/// ```
+const FILL_CODE: [u32; 7] = [
+    0xF900_0025, // str x5, [x1]
+    0x9140_1021, // add x1, x1, #4, lsl #12
+    0xEB02_003F, // cmp x1, x2
+    0x54FF_FFA3, // b.lo loop
+    0xF900_007F, // str xzr, [x3]
+    0xD503_207F, // wfi
+    0x17FF_FFFF, // b halt
+];
+
+const FILL_OFF: usize = 0x200;
+const FILL_GPA: u64 = CODE_GPA + FILL_OFF as u64;
 const HAMMER_OFF: usize = 0x80;
 const HAMMER_GPA: u64 = CODE_GPA + HAMMER_OFF as u64;
+const VERIFY_OFF: usize = 0x180;
+const VERIFY_GPA: u64 = CODE_GPA + VERIFY_OFF as u64;
 const READ_OFF: usize = 0x100;
 const READ_GPA: u64 = CODE_GPA + READ_OFF as u64;
 
@@ -116,6 +184,14 @@ pub fn write_code_page(code: *mut u8) {
     for (i, insn) in READ_CODE.iter().enumerate() {
         // SAFETY: READ_OFF + i*4 < PAGE.
         unsafe { code.add(READ_OFF + i * 4).cast::<u32>().write(*insn) };
+    }
+    for (i, insn) in VERIFY_CODE.iter().enumerate() {
+        // SAFETY: VERIFY_OFF + i*4 < PAGE.
+        unsafe { code.add(VERIFY_OFF + i * 4).cast::<u32>().write(*insn) };
+    }
+    for (i, insn) in FILL_CODE.iter().enumerate() {
+        // SAFETY: FILL_OFF + i*4 < PAGE.
+        unsafe { code.add(FILL_OFF + i * 4).cast::<u32>().write(*insn) };
     }
     // SAFETY: `code` is a valid PAGE-sized mapping we just wrote.
     unsafe { sys_icache_invalidate(code.cast(), PAGE) };
@@ -168,6 +244,49 @@ pub fn run_read_pass(vcpu: u64, exit: *const HvVcpuExitInfo, ram_size: usize) {
 /// Touch pass over a sub-range of guest RAM, `[start_off, end_off)`.
 pub fn run_touch_range(vcpu: u64, exit: *const HvVcpuExitInfo, start_off: usize, end_off: usize) {
     run_pass(vcpu, exit, CODE_GPA, start_off, end_off);
+}
+
+/// One RMW sweep over `[start_off, end_off)`: every page's first word is
+/// incremented once. Unlike [`run_hammer`] this returns after a single
+/// sweep, so a caller can interleave sweeps with other work on the same
+/// vCPU.
+pub fn run_sweep_range(vcpu: u64, exit: *const HvVcpuExitInfo, start_off: usize, end_off: usize) {
+    check(
+        unsafe { hv_vcpu_set_reg(vcpu, HV_REG_X6, RAM_GPA + start_off as u64) },
+        "set X6",
+    );
+    run_pass(vcpu, exit, HAMMER_GPA, start_off, end_off);
+}
+
+/// Stamp `value` into the first word of every page in `[start_off, end_off)`.
+pub fn run_fill_range(
+    vcpu: u64,
+    exit: *const HvVcpuExitInfo,
+    start_off: usize,
+    end_off: usize,
+    value: u64,
+) {
+    check(unsafe { hv_vcpu_set_reg(vcpu, HV_REG_X5, value) }, "set X5");
+    run_pass(vcpu, exit, FILL_GPA, start_off, end_off);
+}
+
+/// Guest-side integrity check over `[start_off, end_off)`: returns how many
+/// pages did NOT hold `expected` in their first word. The host never reads
+/// the range, so the pages keep whatever host-side state is under test.
+pub fn run_verify_range(
+    vcpu: u64,
+    exit: *const HvVcpuExitInfo,
+    start_off: usize,
+    end_off: usize,
+    expected: u64,
+) -> u64 {
+    check(unsafe { hv_vcpu_set_reg(vcpu, HV_REG_X4, 0) }, "clear X4");
+    check(
+        unsafe { hv_vcpu_set_reg(vcpu, HV_REG_X5, expected) },
+        "set X5",
+    );
+    run_pass(vcpu, exit, VERIFY_GPA, start_off, end_off);
+    read_reg(vcpu, HV_REG_X4)
 }
 
 fn run_pass(vcpu: u64, exit: *const HvVcpuExitInfo, entry: u64, start_off: usize, end_off: usize) {

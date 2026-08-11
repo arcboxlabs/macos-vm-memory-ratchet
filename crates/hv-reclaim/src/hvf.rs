@@ -42,6 +42,7 @@ pub const HV_REG_X1: u32 = 1;
 pub const HV_REG_X2: u32 = 2;
 pub const HV_REG_X3: u32 = 3;
 pub const HV_REG_X4: u32 = 4;
+pub const HV_REG_X5: u32 = 5;
 pub const HV_REG_X6: u32 = 6;
 pub const HV_REG_PC: u32 = 31;
 pub const HV_REG_CPSR: u32 = 34;

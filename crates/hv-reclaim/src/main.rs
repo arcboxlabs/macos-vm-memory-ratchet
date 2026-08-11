@@ -50,6 +50,7 @@
 mod fleet_sim;
 mod guest;
 mod hvf;
+mod soak;
 mod timing;
 
 use guest::{run_hammer, run_read_pass, run_touch_pass, write_code_page, CODE_GPA, RAM_GPA};
@@ -123,6 +124,10 @@ struct Options {
     fleet_sim: bool,
     services: usize,
     service_mib: usize,
+    /// Long-duration multi-vCPU integrity soak (--soak).
+    soak: bool,
+    soak_minutes: u64,
+    vcpus: usize,
 }
 
 fn parse_args() -> Options {
@@ -144,6 +149,9 @@ fn parse_args() -> Options {
         fleet_sim: false,
         services: 8,
         service_mib: 256,
+        soak: false,
+        soak_minutes: 60,
+        vcpus: 4,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -196,6 +204,18 @@ fn parse_args() -> Options {
             }
             "--steady-state" => opts.steady_state = true,
             "--fleet-sim" => opts.fleet_sim = true,
+            "--soak" => opts.soak = true,
+            "--soak-minutes" => {
+                opts.soak_minutes = args
+                    .next()
+                    .expect("--soak-minutes N")
+                    .parse()
+                    .expect("integer minutes");
+            }
+            "--vcpus" => {
+                opts.vcpus = args.next().expect("--vcpus N").parse().expect("integer");
+                assert!(opts.vcpus >= 1, "--vcpus must be >= 1");
+            }
             "--services" => {
                 opts.services = args
                     .next()
@@ -227,21 +247,23 @@ fn parse_args() -> Options {
              probes separately"
         );
     }
-    if opts.time_reclaim || opts.fleet_sim {
+    let exclusive =
+        usize::from(opts.time_reclaim) + usize::from(opts.fleet_sim) + usize::from(opts.soak);
+    if exclusive > 0 {
         assert!(
-            !opts.naive && !opts.host_touch && !opts.pressure_check && !opts.hammer,
-            "--time-reclaim/--fleet-sim measure the working sequence; they \
-             exclude --naive, --host-touch and the safety probes"
+            exclusive == 1,
+            "--time-reclaim, --fleet-sim and --soak are separate modes"
         );
         assert!(
-            !(opts.time_reclaim && opts.fleet_sim),
-            "--time-reclaim and --fleet-sim are separate modes"
+            !opts.naive && !opts.host_touch && !opts.pressure_check && !opts.hammer,
+            "--time-reclaim/--fleet-sim/--soak drive the working sequence; \
+             they exclude --naive, --host-touch and the short safety probes"
         );
     } else {
         assert!(
             opts.extent_kb == 0 && !opts.steady_state && opts.reclaim_mode == ReclaimMode::Reusable,
             "--extent-kb, --steady-state and --reclaim-mode only apply to \
-             --time-reclaim"
+             --time-reclaim and --soak"
         );
     }
     opts
@@ -331,6 +353,18 @@ fn main() {
         unsafe { hv_vm_map(ram, RAM_GPA, ram_size, HV_MEMORY_READ | HV_MEMORY_WRITE) },
         "hv_vm_map(ram)",
     );
+
+    // The soak owns its own vCPUs: each must be created by the thread that
+    // runs it, so it dispatches before the single-vCPU path below.
+    if opts.soak {
+        soak::run(ram, &opts);
+        check(unsafe { hv_vm_destroy() }, "hv_vm_destroy");
+        unsafe {
+            libc::munmap(ram.cast(), ram_size);
+            libc::munmap(code.cast(), PAGE);
+        }
+        return;
+    }
 
     let mut vcpu: u64 = 0;
     let mut exit: *const HvVcpuExitInfo = std::ptr::null();
