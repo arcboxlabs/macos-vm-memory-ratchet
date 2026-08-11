@@ -55,12 +55,13 @@ itself INCONCLUSIVE instead of printing a vacuous all-clear.
 
 Two machines, labeled throughout:
 
-- **A** — 128 GiB M-series desktop, macOS 26.4
-- **B** — 16 GiB M4 Mac mini, macOS 26.3.1
+- **A** — 128 GiB M5 Max desktop (18 cores), macOS 26.4
+- **B** — 16 GiB M4 Mac mini (10 cores), macOS 26.3.1
 
-Ledger effects replicate identically on both. Pressure runs are
-conclusive only on B — on A the canary survives behind the file-cache
-moat and the probes self-report INCONCLUSIVE.
+Ledger effects replicate identically on both. Pressure needs to be sized
+per machine: 12 GiB is conclusive on B, and on A the canary survives
+behind the file-cache moat until 64 GiB (48 GiB is absorbed without
+touching either buffer, and the probes self-report INCONCLUSIVE).
 
 `calibrate-madvise`, 1 GiB dirty anonymous memory (A and B, identical):
 
@@ -85,7 +86,7 @@ all 65536/65536 canary pages discarded — in every run):
 | run | guest during pressure | guest data after |
 |---|---|---|
 | `--pressure-check` | parked at the doorbell | **196608/196608 pages intact** |
-| `--hammer` | RMW-incrementing every page — 9155 full sweeps (~1.8 billion stores) racing the scan through build-up, hold, and release | **196608/196608 pages at the exact expected counter, 0 lost** |
+| `--hammer` | RMW-incrementing every page — 9258 full sweeps (~1.8 billion stores) racing the scan through build-up, hold, and release | **196608/196608 pages at the exact expected counter, 0 lost** |
 | `--naive --pressure-check` | parked | **196608/196608 intact; reusable 0 MiB, 273 MiB compressed** — the naive no-op is a *true* no-op: pages stayed in the protected dirty class, they were never lazily armed for discard |
 
 ### Pressure findings
@@ -113,7 +114,7 @@ Getting macOS to *actually steal* pages turned out to be its own result:
   of live data sitting sticky-marked reusable), pressure deep enough to
   annihilate the canary lost **0 of 196608 pages** — with the guest
   parked (`--pressure-check`), and with the guest actively
-  read-modify-writing every page while the scan ran (`--hammer`: 9155
+  read-modify-writing every page while the scan ran (`--hammer`: 9258
   sweeps, every page's counter exact at the end, so a discard at *any*
   moment of the run would have shown). The ledger shows the scanner
   un-marking what the guest re-dirtied (hammer run: reusable
@@ -122,6 +123,51 @@ Getting macOS to *actually steal* pages turned out to be its own result:
   "What the xnu source says" below — the protection is layered and
   starts earlier than the scan. Pair re-exposure with `MADV_FREE_REUSE`
   for prompt accounting, not for correctness.
+
+### What the reclaim costs
+
+`--time-reclaim` times each phase separately and reclaims the 3 GiB
+either whole or as scattered extents, extent-at-a-time — the shape a
+free-page-reporting path has. Medians of 5 cycles, both machines:
+
+| extent | reusable A | reusable B | munmap A | munmap B | vm-map regions after |
+|---|---|---|---|---|---|
+| whole 3 GiB | 35.1 ms | 9.4 ms | 41.6 ms | 13.5 ms | 93 / 93 |
+| 2 MiB (Linux pageblock) | 30.6 | 11.5 | 48.9 | 18.5 | 93 / **1605** |
+| 64 KiB | 120.5 | 68.5 | 175.5 | 98.4 | 93 / 49221 |
+| 16 KiB (one host page) | 502.5 | 241.5 | 600.7 | 354.5 | 93 / **196677** |
+| guest faults it all back | ~211 | ~216 | ~251 | ~244 | — |
+
+Reading:
+
+- **Scattering is free down to 2 MiB.** 1536 separate triples cost what
+  one whole-range triple costs. Below that, fixed per-call overhead
+  takes over — but page-granularity reclaim of 3 GiB is still only
+  0.24–0.5 s.
+- **Fault-back dominates.** Getting the memory back costs the guest
+  6–23× what the host paid to release it. Reclaim is cheap; being wrong
+  about whether the guest will reuse the memory is not.
+- **`munmap` + `MAP_FIXED` costs 19–61% more** and leaves one vm-map
+  entry per extent behind. `MADV_FREE_REUSABLE` leaves the map untouched
+  at every granularity.
+- **The absolute cost is not a platform constant.** The 10-core mini is
+  3.7× *faster* than the 18-core desktop, and the whole gap sits in the
+  two phases that invalidate translations (`hv_vm_unmap`, `madvise`);
+  the lazy remap and the guest's per-page fault-back are equal on both.
+  Consistent with TLBI broadcast completion scaling with the
+  inner-shareable domain — but the machines differ in generation, RAM,
+  and OS build too, so treat it as an observation, not a proof.
+- **The "sticky reusable" accounting artifact is pressure-dependent.**
+  Re-touching after reclaim is unmetered only while the host has room to
+  leave the re-faulted pages parked: on A an 8 GiB guest re-touches for
+  +4 MiB, on B the same run is charged +4919 MiB. It self-corrects
+  exactly when the ledger starts to matter.
+
+`--fleet-sim` (and vz-ratchet's `--fleet`) replay this at workload
+shape: 8 guest services start, hold, and stop. VZ's helper pins at the
+fleet's peak through every stop *and* through a subsequent balloon
+inflation; the HVF reclaim path staircases back to its idle baseline.
+Both machines agree to within 0.1%.
 
 ## Why "placebo" and not "lazy reclaim"
 
