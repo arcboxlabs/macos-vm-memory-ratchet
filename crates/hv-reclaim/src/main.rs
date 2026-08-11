@@ -52,7 +52,7 @@ mod guest;
 mod hvf;
 mod timing;
 
-use guest::{run_hammer, run_touch_pass, write_code_page, CODE_GPA, RAM_GPA};
+use guest::{run_hammer, run_read_pass, run_touch_pass, write_code_page, CODE_GPA, RAM_GPA};
 use hvf::{
     check, hv_vcpu_create, hv_vcpu_destroy, hv_vcpu_set_reg, hv_vm_create, hv_vm_destroy,
     hv_vm_map, hv_vm_unmap, HvVcpuExitInfo, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
@@ -95,6 +95,11 @@ struct Options {
     /// Dirty the RAM from the host instead of running the guest — the
     /// control that shows why host-only calibration misses the trap.
     host_touch: bool,
+    /// Have the guest only READ its RAM (no stores). Separates "the guest
+    /// dirtied the page" from "the guest touched it at all": if a
+    /// read-only pass pins the ledger too, the trap is about mapping and
+    /// wiring, not about dirty state.
+    guest_read: bool,
     /// Parked-guest safety probe (see module docs).
     pressure_check: bool,
     /// Concurrent-write safety probe (see module docs).
@@ -127,6 +132,7 @@ fn parse_args() -> Options {
         size_gb: 3,
         naive: false,
         host_touch: false,
+        guest_read: false,
         pressure_check: false,
         hammer: false,
         pressure_gb: 48,
@@ -159,6 +165,7 @@ fn parse_args() -> Options {
             }
             "--naive" => opts.naive = true,
             "--host-touch" => opts.host_touch = true,
+            "--guest-read" => opts.guest_read = true,
             "--pressure-check" => opts.pressure_check = true,
             "--hammer" => opts.hammer = true,
             "--pressure-gb" => {
@@ -380,6 +387,8 @@ fn main() {
                 // SAFETY: off < ram_size, mapping is writable.
                 unsafe { ram.add(off).cast::<u64>().write(off as u64) };
             }
+        } else if opts.guest_read {
+            run_read_pass(vcpu, exit, ram_size);
         } else {
             run_touch_pass(vcpu, exit, ram_size);
         }

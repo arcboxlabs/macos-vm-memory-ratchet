@@ -66,8 +66,34 @@ const HAMMER_CODE: [u32; 10] = [
     0x17FF_FFF7, // b outer
 ];
 
+/// Read-only sweep: load one word per host page, never store. Separates
+/// "the guest dirtied it" from "the guest merely touched it" — if a
+/// read-only pass also pins the ledger, the trap is about mapping and
+/// wiring, not about dirty state.
+///
+/// ```text
+/// loop: ldr x5, [x1]            ; read one host page
+///       add x1, x1, #4, lsl 12  ; += 16 KiB
+///       cmp x1, x2
+///       b.lo loop
+///       str xzr, [x3]           ; doorbell
+/// halt: wfi
+///       b halt
+/// ```
+const READ_CODE: [u32; 7] = [
+    0xF940_0025, // ldr x5, [x1]
+    0x9140_1021, // add x1, x1, #4, lsl #12
+    0xEB02_003F, // cmp x1, x2
+    0x54FF_FFA3, // b.lo loop
+    0xF900_007F, // str xzr, [x3]
+    0xD503_207F, // wfi
+    0x17FF_FFFF, // b halt
+];
+
 const HAMMER_OFF: usize = 0x80;
 const HAMMER_GPA: u64 = CODE_GPA + HAMMER_OFF as u64;
+const READ_OFF: usize = 0x100;
+const READ_GPA: u64 = CODE_GPA + READ_OFF as u64;
 
 unsafe extern "C" {
     /// libkern/OSCacheControl.h: clean D-cache to the point of unification
@@ -86,6 +112,10 @@ pub fn write_code_page(code: *mut u8) {
     for (i, insn) in HAMMER_CODE.iter().enumerate() {
         // SAFETY: HAMMER_OFF + i*4 < PAGE.
         unsafe { code.add(HAMMER_OFF + i * 4).cast::<u32>().write(*insn) };
+    }
+    for (i, insn) in READ_CODE.iter().enumerate() {
+        // SAFETY: READ_OFF + i*4 < PAGE.
+        unsafe { code.add(READ_OFF + i * 4).cast::<u32>().write(*insn) };
     }
     // SAFETY: `code` is a valid PAGE-sized mapping we just wrote.
     unsafe { sys_icache_invalidate(code.cast(), PAGE) };
@@ -129,12 +159,19 @@ pub fn run_touch_pass(vcpu: u64, exit: *const HvVcpuExitInfo, ram_size: usize) {
     run_touch_range(vcpu, exit, 0, ram_size);
 }
 
+/// One read-only pass over all of guest RAM: the control that separates
+/// dirtying from touching.
+pub fn run_read_pass(vcpu: u64, exit: *const HvVcpuExitInfo, ram_size: usize) {
+    run_pass(vcpu, exit, READ_GPA, 0, ram_size);
+}
+
 /// Touch pass over a sub-range of guest RAM, `[start_off, end_off)`.
 pub fn run_touch_range(vcpu: u64, exit: *const HvVcpuExitInfo, start_off: usize, end_off: usize) {
-    check(
-        unsafe { hv_vcpu_set_reg(vcpu, HV_REG_PC, CODE_GPA) },
-        "set PC",
-    );
+    run_pass(vcpu, exit, CODE_GPA, start_off, end_off);
+}
+
+fn run_pass(vcpu: u64, exit: *const HvVcpuExitInfo, entry: u64, start_off: usize, end_off: usize) {
+    check(unsafe { hv_vcpu_set_reg(vcpu, HV_REG_PC, entry) }, "set PC");
     check(
         unsafe { hv_vcpu_set_reg(vcpu, HV_REG_X1, RAM_GPA + start_off as u64) },
         "set X1",

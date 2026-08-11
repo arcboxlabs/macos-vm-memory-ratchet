@@ -87,7 +87,7 @@ all 65536/65536 canary pages discarded — in every run):
 |---|---|---|
 | `--pressure-check` | parked at the doorbell | **196608/196608 pages intact** |
 | `--hammer` | RMW-incrementing every page — 9258 full sweeps (~1.8 billion stores) racing the scan through build-up, hold, and release | **196608/196608 pages at the exact expected counter, 0 lost** |
-| `--naive --pressure-check` | parked | **196608/196608 intact; reusable 0 MiB, 273 MiB compressed** — the naive no-op is a *true* no-op: pages stayed in the protected dirty class, they were never lazily armed for discard |
+| `--naive --pressure-check` | parked | **196608/196608 intact; reusable 0 MiB, 69.1 MiB compressed** — the naive no-op is a *true* no-op: pages stayed in the protected dirty class, they were never lazily armed for discard |
 
 ### Pressure findings
 
@@ -116,13 +116,23 @@ Getting macOS to *actually steal* pages turned out to be its own result:
   parked (`--pressure-check`), and with the guest actively
   read-modify-writing every page while the scan ran (`--hammer`: 9258
   sweeps, every page's counter exact at the end, so a discard at *any*
-  moment of the run would have shown). The ledger shows the scanner
-  un-marking what the guest re-dirtied (hammer run: reusable
-  3072 → 2061 MiB, footprint 3 → 1015 MiB) and compressing it like any
-  live data. Why the data survives is traced through kernel source in
-  "What the xnu source says" below — the protection is layered and
-  starts earlier than the scan. Pair re-exposure with `MADV_FREE_REUSE`
-  for prompt accounting, not for correctness.
+  moment of the run would have shown). The two runs fail differently,
+  which is the interesting part:
+
+  | probe | reusable before → after | compressed | resident |
+  |---|---|---|---|
+  | parked | 3072 → **3072** | 0 | unchanged |
+  | hammer | 3072 → **2395.6** | 0 | unchanged |
+  | naive | 0 → 0 | 69.1 | −69 |
+
+  With the guest parked the scan does not touch these pages at all. With
+  the guest writing, 676 MiB gets **un-marked out of reusable and charged
+  back** (footprint 3.2 → 680.1 MiB) — the scanner reclaiming its
+  permission, not the data. Nothing was compressed in either reusable run;
+  nothing was evicted in any of them. Why the data survives is traced
+  through kernel source in "What the xnu source says" below — the
+  protection is layered and starts earlier than the scan. Pair re-exposure
+  with `MADV_FREE_REUSE` for prompt accounting, not for correctness.
 
 ### What the reclaim costs
 
