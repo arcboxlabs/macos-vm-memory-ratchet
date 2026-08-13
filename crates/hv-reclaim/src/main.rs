@@ -47,6 +47,7 @@
 //! ./run.sh --repeat 5     # variance of the reclaim cycle
 //! ```
 
+mod alloc_shape;
 mod fleet_sim;
 mod guest;
 mod hvf;
@@ -124,6 +125,10 @@ struct Options {
     fleet_sim: bool,
     services: usize,
     service_mib: usize,
+    /// The allocation-shape discriminator (--alloc-shape): does the trap
+    /// depend on how guest RAM was allocated, including Apple's own
+    /// hv_vm_allocate? Drives its own child processes and returns.
+    alloc_shape: bool,
     /// Long-duration multi-vCPU integrity soak (--soak).
     soak: bool,
     soak_minutes: u64,
@@ -140,6 +145,7 @@ fn parse_args() -> Options {
         guest_read: false,
         pressure_check: false,
         hammer: false,
+        alloc_shape: false,
         pressure_gb: 48,
         repeat: 1,
         time_reclaim: false,
@@ -204,6 +210,7 @@ fn parse_args() -> Options {
             }
             "--steady-state" => opts.steady_state = true,
             "--fleet-sim" => opts.fleet_sim = true,
+            "--alloc-shape" => opts.alloc_shape = true,
             "--soak" => opts.soak = true,
             "--soak-minutes" => {
                 opts.soak_minutes = args
@@ -247,17 +254,20 @@ fn parse_args() -> Options {
              probes separately"
         );
     }
-    let exclusive =
-        usize::from(opts.time_reclaim) + usize::from(opts.fleet_sim) + usize::from(opts.soak);
+    let exclusive = usize::from(opts.time_reclaim)
+        + usize::from(opts.fleet_sim)
+        + usize::from(opts.soak)
+        + usize::from(opts.alloc_shape);
     if exclusive > 0 {
         assert!(
             exclusive == 1,
-            "--time-reclaim, --fleet-sim and --soak are separate modes"
+            "--time-reclaim, --fleet-sim, --soak and --alloc-shape are separate modes"
         );
         assert!(
             !opts.naive && !opts.host_touch && !opts.pressure_check && !opts.hammer,
-            "--time-reclaim/--fleet-sim/--soak drive the working sequence; \
-             they exclude --naive, --host-touch and the short safety probes"
+            "--time-reclaim/--fleet-sim/--soak/--alloc-shape drive their own \
+             sequences; they exclude --naive, --host-touch and the short \
+             safety probes"
         );
     } else {
         assert!(
@@ -307,9 +317,18 @@ fn print_canary(v: &ledger::canary::Verdict) {
 
 fn main() {
     ledger::pressure::maybe_run_generator();
+    alloc_shape::maybe_run_cell();
     ledger::assert_host_page_size();
 
     let opts = parse_args();
+
+    // The discriminator drives one child process per cell and never touches
+    // this task's VM or ledger; dispatch before any mapping happens here.
+    if opts.alloc_shape {
+        alloc_shape::run(opts.size_gb);
+        return;
+    }
+
     let ram_size = opts.size_gb << 30;
     let pages = ram_size / PAGE;
 

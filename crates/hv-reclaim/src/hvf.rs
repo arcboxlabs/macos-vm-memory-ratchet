@@ -32,7 +32,16 @@ unsafe extern "C" {
     pub fn hv_vcpu_run(vcpu: u64) -> i32;
     pub fn hv_vcpu_set_reg(vcpu: u64, reg: u32, value: u64) -> i32;
     pub fn hv_vcpu_get_reg(vcpu: u64, reg: u32, value: *mut u64) -> i32;
+
+    /// Apple's own allocator for guest RAM (macOS 12.1+ on arm64). Its
+    /// header carries the platform's only statement about the accounting
+    /// contract --- "This API enables accurate memory accounting of the
+    /// allocations it creates" --- which is why `alloc_shape` tests it.
+    pub fn hv_vm_allocate(uvap: *mut *mut u8, size: usize, flags: u64) -> i32;
+    pub fn hv_vm_deallocate(uva: *mut u8, size: usize) -> i32;
 }
+
+pub const HV_ALLOCATE_DEFAULT: u64 = 0;
 
 pub const HV_MEMORY_READ: u64 = 1 << 0;
 pub const HV_MEMORY_WRITE: u64 = 1 << 1;
